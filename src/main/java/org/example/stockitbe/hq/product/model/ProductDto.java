@@ -19,7 +19,11 @@ public class ProductDto {
         @NotBlank private String categoryCode;
         @NotNull @Min(0) private Long basePrice;
         @NotNull @Min(0) private Integer leadTimeDays;
+        @NotNull @Min(0) private Integer warehouseSafetyStock;
+        @NotNull @Min(0) private Integer storeSafetyStock;
         @NotBlank private String mainVendorCode;
+        @NotNull private ProductMaterialType materialType;
+        @NotNull private List<ProductMaterialCompositionReq> materialCompositions;
         @NotNull private ProductStatus status;
 
         public ProductMaster toEntity(String code) {
@@ -29,6 +33,8 @@ public class ProductDto {
                     .categoryCode(categoryCode.trim())
                     .basePrice(basePrice)
                     .leadTimeDays(leadTimeDays)
+                    .warehouseSafetyStock(warehouseSafetyStock)
+                    .storeSafetyStock(storeSafetyStock)
                     .mainVendorCode(mainVendorCode.trim())
                     .status(status)
                     .build();
@@ -39,9 +45,18 @@ public class ProductDto {
     @NoArgsConstructor
     @AllArgsConstructor
     @Builder
+    public static class ProductMaterialCompositionReq {
+        @NotBlank private String materialCode;
+        @NotNull @Min(0) private Integer ratio;
+    }
+
+    @Getter
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @Builder
     public static class ProductSkuUpsertReq {
-        @NotBlank private String optionName;
-        @NotBlank private String optionValue;
+        @NotBlank private String color;
+        @NotBlank private String size;
         @NotNull @Min(0) private Long unitPrice;
         @NotNull private ProductStatus status;
 
@@ -49,8 +64,8 @@ public class ProductDto {
             return ProductSku.builder()
                     .skuCode(skuCode)
                     .productCode(productCode)
-                    .optionName(optionName.trim())
-                    .optionValue(optionValue.trim())
+                    .color(color.trim())
+                    .size(size.trim())
                     .unitPrice(unitPrice)
                     .status(status)
                     .build();
@@ -62,8 +77,8 @@ public class ProductDto {
     @AllArgsConstructor
     @Builder
     public static class ProductSkuBulkCreateReq {
-        @NotBlank private String optionName;
-        @NotNull private List<String> optionValues;
+        @NotNull private List<String> colors;
+        @NotNull private List<String> sizes;
         @NotNull @Min(0) private Long unitPrice;
         @NotNull private ProductStatus status;
     }
@@ -93,19 +108,42 @@ public class ProductDto {
         private String categoryCode;
         private Long basePrice;
         private Integer leadTimeDays;
+        private Integer warehouseSafetyStock;
+        private Integer storeSafetyStock;
         private String mainVendorCode;
+        private ProductMaterialType materialType;
+        private List<ProductMaterialCompositionRes> materialCompositions;
         private ProductStatus status;
         private long skuCount;
         private Date updatedAt;
 
-        public static ProductMasterRes from(ProductMaster m, long skuCount) {
+        public static ProductMasterRes from(ProductMaster m,
+                                            long skuCount,
+                                            ProductMaterialType materialType,
+                                            java.util.Map<String, String> materialNameMap) {
+            List<ProductMaterialCompositionRes> compositions = m.getMaterialCompositions() == null
+                    ? List.of()
+                    : m.getMaterialCompositions().stream()
+                    .map(c -> {
+                        String code = c.getMaterial() == null ? "" : c.getMaterial().getCode();
+                        return ProductMaterialCompositionRes.builder()
+                                .materialCode(code)
+                                .materialNameKo(materialNameMap.getOrDefault(code, code))
+                                .ratio(c.getRatio())
+                                .build();
+                    })
+                    .toList();
             return ProductMasterRes.builder()
                     .code(m.getCode())
                     .name(m.getName())
                     .categoryCode(m.getCategoryCode())
                     .basePrice(m.getBasePrice())
                     .leadTimeDays(m.getLeadTimeDays())
+                    .warehouseSafetyStock(m.getWarehouseSafetyStock())
+                    .storeSafetyStock(m.getStoreSafetyStock())
                     .mainVendorCode(m.getMainVendorCode())
+                    .materialType(materialType)
+                    .materialCompositions(compositions)
                     .status(m.getStatus())
                     .skuCount(skuCount)
                     .updatedAt(m.getUpdatedAt())
@@ -114,13 +152,24 @@ public class ProductDto {
     }
 
     @Getter
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @Builder
+    public static class ProductMaterialCompositionRes {
+        private String materialCode;
+        private String materialNameKo;
+        private Integer ratio;
+    }
+
+    @Getter
     @AllArgsConstructor
     @Builder
     public static class ProductSkuRes {
         private String skuCode;
         private String productCode;
-        private String optionName;
-        private String optionValue;
+        private String color;
+        private String size;
+        private String displayOption;
         private Long unitPrice;
         private ProductStatus status;
         private Date updatedAt;
@@ -129,8 +178,9 @@ public class ProductDto {
             return ProductSkuRes.builder()
                     .skuCode(sku.getSkuCode())
                     .productCode(sku.getProductCode())
-                    .optionName(sku.getOptionName())
-                    .optionValue(sku.getOptionValue())
+                    .color(sku.getColor())
+                    .size(sku.getSize())
+                    .displayOption(sku.getColor() + "/" + sku.getSize())
                     .unitPrice(sku.getUnitPrice())
                     .status(sku.getStatus())
                     .updatedAt(sku.getUpdatedAt())

@@ -7,6 +7,9 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import org.example.stockitbe.common.model.BaseEntity;
 
+import java.util.ArrayList;
+import java.util.List;
+
 @Entity
 @Table(name = "product_master", uniqueConstraints = {
         @UniqueConstraint(name = "uk_product_master_code", columnNames = "code")
@@ -33,8 +36,18 @@ public class ProductMaster extends BaseEntity {
     @Column(name = "lead_time_days", nullable = false)
     private Integer leadTimeDays;
 
+    @Column(name = "warehouse_safety_stock", nullable = false)
+    private Integer warehouseSafetyStock;
+
+    @Column(name = "store_safety_stock", nullable = false)
+    private Integer storeSafetyStock;
+
     @Column(name = "main_vendor_code", nullable = false, length = 32)
     private String mainVendorCode;
+
+    @OneToMany(mappedBy = "productMaster", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OrderBy("compositionOrder ASC, id ASC")
+    private List<ProductMaterialComposition> materialCompositions = new ArrayList<>();
 
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 16)
@@ -42,22 +55,39 @@ public class ProductMaster extends BaseEntity {
 
     @Builder
     private ProductMaster(String code, String name, String categoryCode, Long basePrice, Integer leadTimeDays,
-                          String mainVendorCode, ProductStatus status) {
+                          Integer warehouseSafetyStock, Integer storeSafetyStock, String mainVendorCode,
+                          ProductStatus status) {
         this.code = code;
         this.name = name;
         this.categoryCode = categoryCode;
         this.basePrice = basePrice;
         this.leadTimeDays = leadTimeDays;
+        this.warehouseSafetyStock = warehouseSafetyStock == null ? 0 : warehouseSafetyStock;
+        this.storeSafetyStock = storeSafetyStock == null ? 0 : storeSafetyStock;
         this.mainVendorCode = mainVendorCode;
         this.status = status == null ? ProductStatus.ACTIVE : status;
     }
 
-    public void update(String name, String categoryCode, Long basePrice, Integer leadTimeDays, String mainVendorCode, ProductStatus status) {
+    public void update(String name, String categoryCode, Long basePrice, Integer leadTimeDays, Integer warehouseSafetyStock,
+                       Integer storeSafetyStock, String mainVendorCode, ProductStatus status) {
         this.name = name;
         this.categoryCode = categoryCode;
         this.basePrice = basePrice;
         this.leadTimeDays = leadTimeDays;
+        this.warehouseSafetyStock = warehouseSafetyStock == null ? 0 : warehouseSafetyStock;
+        this.storeSafetyStock = storeSafetyStock == null ? 0 : storeSafetyStock;
         this.mainVendorCode = mainVendorCode;
         this.status = status;
+    }
+
+    public void replaceMaterialCompositions(List<ProductMaterialComposition> compositions) {
+        this.materialCompositions.clear();
+        if (compositions == null) {
+            return;
+        }
+        for (ProductMaterialComposition composition : compositions) {
+            composition.assignProductMaster(this);
+            this.materialCompositions.add(composition);
+        }
     }
 }

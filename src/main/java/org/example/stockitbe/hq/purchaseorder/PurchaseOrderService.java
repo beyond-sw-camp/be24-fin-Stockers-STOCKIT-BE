@@ -4,8 +4,10 @@ import jakarta.persistence.criteria.Predicate;
 import lombok.RequiredArgsConstructor;
 import org.example.stockitbe.common.exception.BaseException;
 import org.example.stockitbe.common.model.BaseResponseStatus;
-import org.example.stockitbe.hq.infrastructure.WarehouseRepository;
-import org.example.stockitbe.hq.infrastructure.model.Warehouse;
+import org.example.stockitbe.hq.infrastructure.InfrastructureRepository;
+import org.example.stockitbe.hq.infrastructure.model.Infrastructure;
+import org.example.stockitbe.hq.infrastructure.model.LocationType;
+import org.example.stockitbe.hq.inventory.InventoryService;
 import org.example.stockitbe.hq.product.ProductSkuRepository;
 import org.example.stockitbe.hq.product.model.ProductSku;
 import org.example.stockitbe.hq.product.model.ProductStatus;
@@ -18,6 +20,7 @@ import org.example.stockitbe.hq.vendor.VendorProductRepository;
 import org.example.stockitbe.hq.vendor.VendorRepository;
 import org.example.stockitbe.hq.vendor.model.Vendor;
 import org.example.stockitbe.hq.vendor.model.VendorProduct;
+import org.example.stockitbe.user.model.AuthUserDetails;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -37,8 +40,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class PurchaseOrderService {
 
-    private static final String HQ_MANAGER_ACTOR = "본사 관리자";
-    private static final String WAREHOUSE_MANAGER_ACTOR = "창고 관리자";
     private static final DateTimeFormatter CODE_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     private final PurchaseOrderRepository purchaseOrderRepository;
@@ -46,8 +47,9 @@ public class PurchaseOrderService {
     private final PurchaseOrderStatusHistoryRepository historyRepository;
     private final VendorRepository vendorRepository;
     private final VendorProductRepository vendorProductRepository;
-    private final WarehouseRepository warehouseRepository;
+    private final InfrastructureRepository infrastructureRepository;
     private final ProductSkuRepository productSkuRepository;
+    private final InventoryService inventoryService;
 
     @Transactional(readOnly = true)
     public List<PurchaseOrderDto.ListRes> findAll(String vendorCode, PurchaseOrderStatus status,
@@ -70,8 +72,9 @@ public class PurchaseOrderService {
                 .collect(Collectors.toMap(Vendor::getId, v -> v));
 
         Set<Long> warehouseIds = orders.stream().map(PurchaseOrder::getWarehouseId).collect(Collectors.toSet());
-        Map<Long, String> warehouseCodeById = warehouseRepository.findAllById(warehouseIds).stream()
-                .collect(Collectors.toMap(Warehouse::getId, Warehouse::getCode));
+        Map<Long, String> warehouseCodeById = infrastructureRepository.findAllById(warehouseIds).stream()
+                .filter(infra -> infra.getLocationType() == LocationType.WAREHOUSE)
+                .collect(Collectors.toMap(Infrastructure::getId, Infrastructure::getCode));
 
         Set<Long> orderIds = orders.stream().map(PurchaseOrder::getId).collect(Collectors.toSet());
         // batch 1회 조회 결과를 itemCountMap + productNamesMap 두 가지로 활용 (쿼리 0추가)
@@ -104,13 +107,13 @@ public class PurchaseOrderService {
     }
 
     @Transactional
-    public PurchaseOrderDto.DetailRes create(PurchaseOrderDto.CreateReq req) {
+    public PurchaseOrderDto.DetailRes create(PurchaseOrderDto.CreateReq req, AuthUserDetails me) {
         if (req.getItems() == null || req.getItems().isEmpty()) {
             throw BaseException.from(BaseResponseStatus.PURCHASE_ORDER_EMPTY_ITEMS);
         }
 
         Vendor vendor = lookupVendor(req.getVendorCode());
-        Warehouse warehouse = lookupWarehouse(req.getWarehouseCode());
+        Infrastructure warehouse = lookupWarehouse(req.getWarehouseCode());
 
         // items 의 vendorProduct 모두 조회 + vendor 일치 검증
         List<VendorProduct> vendorProducts = req.getItems().stream()
@@ -150,7 +153,7 @@ public class PurchaseOrderService {
         }
         itemRepository.saveAll(items);
 
-        appendHistory(saved, null);
+        appendHistory(saved, null, me);
 
         return buildDetailRes(saved);
     }
@@ -162,11 +165,11 @@ public class PurchaseOrderService {
         }
 
         PurchaseOrder po = lookupPurchaseOrder(code);
-        if (po.getStatus() != PurchaseOrderStatus.PENDING) {
+        if (po.getStatus() != PurchaseOrderStatus.REQUESTED) {
             throw BaseException.from(BaseResponseStatus.PURCHASE_ORDER_INVALID_STATUS_TRANSITION);
         }
 
-        Warehouse warehouse = lookupWarehouse(req.getWarehouseCode());
+        Infrastructure warehouse = lookupWarehouse(req.getWarehouseCode());
 
         // items 의 vendorProduct 검증 (vendor 일치)
         List<VendorProduct> vendorProducts = req.getItems().stream()
@@ -211,42 +214,68 @@ public class PurchaseOrderService {
     public PurchaseOrderDto.DetailRes approve(String code) {
         PurchaseOrder po = lookupPurchaseOrder(code);
         po.markApproved();
-        appendHistory(po, null);
+        appendHistory(po, null, null);
         return buildDetailRes(po);
     }
 
     @Transactional
-    public PurchaseOrderDto.DetailRes startShipping(String code) {
+    public PurchaseOrderDto.DetailRes readyToShip(String code) {
         PurchaseOrder po = lookupPurchaseOrder(code);
-        po.markShipping();
-        appendHistory(po, null);
+        po.markReadyToShip();
+        appendHistory(po, null, null);
         return buildDetailRes(po);
     }
 
     @Transactional
-    public PurchaseOrderDto.DetailRes deliver(String code) {
+    public PurchaseOrderDto.DetailRes startInTransit(String code) {
         PurchaseOrder po = lookupPurchaseOrder(code);
-        po.markDelivered();
-        appendHistory(po, null);
+        po.markInTransit();
+        appendHistory(po, null, null);
+        // 발주 ↔ 인벤토리 연결 — 가용재고 += 발주 수량 (도착 전 예약). PR #173 위치로 복귀
+        // (이전 사이클에서 inbound 로 잠시 이동했다가 ERP 표준 정정으로 다시 PO 책임으로).
+        itemRepository.findAllByPurchaseOrderId(po.getId())
+                .forEach(it -> inventoryService.increaseAvailable(po.getWarehouseId(), it.getSkuCode(), it.getQuantity()));
         return buildDetailRes(po);
     }
 
     @Transactional
-    public PurchaseOrderDto.DetailRes complete(String code) {
+    public PurchaseOrderDto.DetailRes arrive(String code) {
+        PurchaseOrder po = lookupPurchaseOrder(code);
+        po.markArrived();
+        appendHistory(po, null, null);
+        return buildDetailRes(po);
+    }
+
+    @Transactional
+    public PurchaseOrderDto.DetailRes complete(String code, AuthUserDetails me) {
         PurchaseOrder po = lookupPurchaseOrder(code);
         po.markCompleted();
-        appendHistory(po, null);
+        appendHistory(po, null, me);
+        // 인벤토리 hook 제거 — WhInboundService.confirmInbound 가 책임 (PR #173 위치 이동).
+        // 이 메소드의 외부 호출처는 step 4 에서 WhInboundController 로 갈아끼워질 때 사라짐.
         return buildDetailRes(po);
     }
 
+    /**
+     * inbound.confirmInbound 가 호출하는 PO mirror entry point.
+     * inbound 가 진실 원천이 되는 입고 확정 시점에 PO 도 COMPLETED 박음 (본사 리스트 "종료" 표시).
+     */
     @Transactional
-    public PurchaseOrderDto.DetailRes cancel(String code, PurchaseOrderDto.CancelReq req) {
+    public void completeFromInbound(String code, AuthUserDetails me) {
+        PurchaseOrder po = lookupPurchaseOrder(code);
+        po.markCompleted();
+        appendHistory(po, null, me);
+        // 인벤토리 갱신 X — inbound 가 책임
+    }
+
+    @Transactional
+    public PurchaseOrderDto.DetailRes cancel(String code, PurchaseOrderDto.CancelReq req, AuthUserDetails me) {
         if (req.getCancelReason() == null || req.getCancelReason().isBlank()) {
             throw BaseException.from(BaseResponseStatus.PURCHASE_ORDER_CANCEL_REASON_REQUIRED);
         }
         PurchaseOrder po = lookupPurchaseOrder(code);
-        po.markRejected(req.getCancelReason());
-        appendHistory(po, req.getCancelReason());
+        po.markCancelled(req.getCancelReason());
+        appendHistory(po, req.getCancelReason(), me);
         return buildDetailRes(po);
     }
 
@@ -267,12 +296,16 @@ public class PurchaseOrderService {
                 .orElseThrow(() -> BaseException.from(BaseResponseStatus.VENDOR_PRODUCT_NOT_FOUND));
     }
 
-    private Warehouse lookupWarehouse(String code) {
+    private Infrastructure lookupWarehouse(String code) {
         if (code == null || code.isBlank()) {
             throw BaseException.from(BaseResponseStatus.WAREHOUSE_NOT_FOUND);
         }
-        return warehouseRepository.findByCode(code)
+        Infrastructure warehouse = infrastructureRepository.findByCode(code)
                 .orElseThrow(() -> BaseException.from(BaseResponseStatus.WAREHOUSE_NOT_FOUND));
+        if (warehouse.getLocationType() != LocationType.WAREHOUSE) {
+            throw BaseException.from(BaseResponseStatus.WAREHOUSE_NOT_FOUND);
+        }
+        return warehouse;
     }
 
     private ProductSku lookupSku(String skuCode) {
@@ -285,30 +318,34 @@ public class PurchaseOrderService {
     }
 
     /**
-     * 코드 자동 생성 — PO-{YYYYMMDD}-{NNN}.
-     * NNN 은 같은 날 prefix count + 1 (3자리 zero-pad).
+     * 코드 자동 생성 — PO-{YYYYMMDD}-{NNNNN}.
+     * NNNNN 은 같은 날 prefix count + 1 (5자리 zero-pad).
      */
     private String generateCode() {
         String today = LocalDate.now().format(CODE_DATE_FORMAT);
         String prefix = "PO-" + today + "-";
         long seq = purchaseOrderRepository.countByCodeStartingWith(prefix) + 1;
-        return String.format("%s%03d", prefix, seq);
+        return String.format("%s%05d", prefix, seq);
     }
 
     /**
      * 진행 이력 한 행 추가. changedByName 은 도메인 책임자 기준 분기:
-     *   - APPROVED / SHIPPING / DELIVERED : "담당자명 (회사명)" 형식 — 발주 시점 거래처 스냅샷
-     *     (실제 트리거는 SYS-001 배치지만 자동화는 구현 디테일이라 도메인 이력에 노출하지 않음, ADR-013/019)
-     *     실무 ERP 표준 — 법적 주체(회사) + 실무 처리자(담당자) 둘 다 노출.
-     *   - COMPLETED            : 입고 확정은 창고 관리자 책임
-     *   - PENDING(생성) / REJECTED(취소) : 본사 관리자
-     * 인증 도입(ADR-011) 후 본사·창고 관리자명은 실제 사용자명으로 교체.
+     *   - APPROVED / READY_TO_SHIP / IN_TRANSIT / ARRIVED : "담당자명 (회사명)" 형식 — 발주 시점 공급처 스냅샷.
+     *     실제 트리거는 SYS-001 배치(거래처 책임 단계 자동화) — 자동화는 구현 디테일이라 도메인 이력에 노출하지 않음 (ADR-013/019).
+     *     실무 ERP 표준 — 법적 주체(회사) + 실무 처리자(담당자) 둘 다 노출. 배치 호출이라 인증 사용자 없음 (me=null).
+     *   - REQUESTED / COMPLETED / CANCELLED : 인증 사용자(me) 의 실명. me 가 null 이면 NOT_AUTHENTICATED.
+     *     본사 작성/창고 입고 확정/본사 취소 — 인증된 담당자의 책임 단계.
      */
-    private void appendHistory(PurchaseOrder po, String note) {
+    private void appendHistory(PurchaseOrder po, String note, AuthUserDetails me) {
         String changedByName = switch (po.getStatus()) {
-            case APPROVED, SHIPPING, DELIVERED -> po.getVendorContactName() + " (" + po.getVendorName() + ")";
-            case COMPLETED -> WAREHOUSE_MANAGER_ACTOR;
-            default -> HQ_MANAGER_ACTOR;
+            case APPROVED, READY_TO_SHIP, IN_TRANSIT, ARRIVED ->
+                    po.getVendorContactName() + " (" + po.getVendorName() + ")";
+            case REQUESTED, COMPLETED, CANCELLED -> {
+                if (me == null) {
+                    throw BaseException.from(BaseResponseStatus.NOT_AUTHENTICATED);
+                }
+                yield me.getName() + " (" + me.getLocationName() + ")";
+            }
         };
         PurchaseOrderStatusHistory entry = PurchaseOrderStatusHistory.builder()
                 .purchaseOrderId(po.getId())
@@ -324,8 +361,9 @@ public class PurchaseOrderService {
                 .orElseThrow(() -> BaseException.from(BaseResponseStatus.VENDOR_NOT_FOUND));
 
         // warehouse code lookup (응답용 — id → code 변환)
-        String warehouseCode = warehouseRepository.findById(po.getWarehouseId())
-                .map(Warehouse::getCode)
+        String warehouseCode = infrastructureRepository.findById(po.getWarehouseId())
+                .filter(infra -> infra.getLocationType() == LocationType.WAREHOUSE)
+                .map(Infrastructure::getCode)
                 .orElse("");
 
         List<PurchaseOrderItem> items = itemRepository.findAllByPurchaseOrderId(po.getId());

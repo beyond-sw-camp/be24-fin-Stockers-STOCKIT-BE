@@ -2,6 +2,10 @@ package org.example.stockitbe.warehouse.dashboard;
 
 import jakarta.persistence.criteria.Predicate;
 import lombok.RequiredArgsConstructor;
+import org.example.stockitbe.common.exception.BaseException;
+import org.example.stockitbe.common.model.BaseResponseStatus;
+import org.example.stockitbe.hq.infrastructure.InfrastructureRepository;
+import org.example.stockitbe.hq.infrastructure.model.LocationType;
 import org.example.stockitbe.hq.purchaseorder.PurchaseOrderRepository;
 import org.example.stockitbe.hq.purchaseorder.PurchaseOrderStatusHistoryRepository;
 import org.example.stockitbe.hq.purchaseorder.model.PurchaseOrder;
@@ -28,7 +32,8 @@ import java.util.stream.Collectors;
  * 집계 대상은 `purchase_order` + `purchase_order_status_history` 단일 진실 원천 (ADR-015).
  * 별 테이블·Entity 신설 없이 read-only 활용만 한다.
  *
- * 인증 미정(ADR-011) 으로 warehouseId 는 옵셔널 query 파라미터.
+ * 인증 사용자의 locationCode 를 받아 자기 창고 row 만 집계. Long warehouseId 는
+ * Infrastructure lookup 한 번에 격리되어 기존 Specification 로직 변경 없음.
  */
 @Service
 @RequiredArgsConstructor
@@ -36,19 +41,28 @@ public class DashboardService {
 
     private final PurchaseOrderRepository purchaseOrderRepository;
     private final PurchaseOrderStatusHistoryRepository historyRepository;
+    private final InfrastructureRepository infrastructureRepository;
 
     @Transactional(readOnly = true)
-    public DashboardDto.InboundProgressRes getInboundProgress(Long warehouseId,
+    public DashboardDto.InboundProgressRes getInboundProgress(String locationCode,
                                                                 LocalDate from, LocalDate to) {
+        Long warehouseId = infrastructureRepository
+                .findByCodeAndLocationType(locationCode, LocationType.WAREHOUSE)
+                .orElseThrow(() -> BaseException.from(BaseResponseStatus.WAREHOUSE_NOT_FOUND))
+                .getId();
         Specification<PurchaseOrder> spec = buildSpec(warehouseId, from, to);
         List<PurchaseOrder> orders = purchaseOrderRepository.findAll(spec);
 
         Map<PurchaseOrderStatus, Long> statusBreakdown = buildStatusBreakdown(orders);
 
-        long scheduledCount = statusBreakdown.get(PurchaseOrderStatus.SHIPPING);
+        // scheduledCount 의미 — 입고 예정(미완료 거래처 단계 합산): READY_TO_SHIP + IN_TRANSIT + ARRIVED.
+        // 단일 SHIPPING 상태가 사라지고 거래처 단계가 4단계로 늘어났으므로 합산이 자연.
+        long scheduledCount = statusBreakdown.get(PurchaseOrderStatus.READY_TO_SHIP)
+                + statusBreakdown.get(PurchaseOrderStatus.IN_TRANSIT)
+                + statusBreakdown.get(PurchaseOrderStatus.ARRIVED);
         long completedCount = statusBreakdown.get(PurchaseOrderStatus.COMPLETED);
-        long rejectedCount = statusBreakdown.get(PurchaseOrderStatus.REJECTED);
-        long totalCount = orders.size() - rejectedCount;
+        long cancelledCount = statusBreakdown.get(PurchaseOrderStatus.CANCELLED);
+        long totalCount = orders.size() - cancelledCount;
         double progressRate = totalCount == 0 ? 0.0 : (double) completedCount / totalCount;
 
         Double avgProcessingHours = computeAvgProcessingHours(orders);
