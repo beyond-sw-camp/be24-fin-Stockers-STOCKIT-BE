@@ -60,17 +60,17 @@ class PurchaseOrderCatalogServiceTest {
                 .status(VendorStatus.ACTIVE).build();
         ReflectionTestUtils.setField(vendorB, "id", 2L);
 
-        vpA1 = VendorProduct.builder().code("VP-A-001").vendorId(1L)
+        vpA1 = VendorProduct.builder().code("VP-A-001").vendor(vendorA)
                 .productCode("PM-A").productName("티셔츠").unitPrice(6800L)
                 .status(VendorProductStatus.ACTIVE).build();
         ReflectionTestUtils.setField(vpA1, "id", 11L);
 
-        vpB1 = VendorProduct.builder().code("VP-B-001").vendorId(2L)
+        vpB1 = VendorProduct.builder().code("VP-B-001").vendor(vendorB)
                 .productCode("PM-B").productName("니트").unitPrice(15000L)
                 .status(VendorProductStatus.ACTIVE).build();
         ReflectionTestUtils.setField(vpB1, "id", 21L);
 
-        vpA2 = VendorProduct.builder().code("VP-A-002").vendorId(1L)
+        vpA2 = VendorProduct.builder().code("VP-A-002").vendor(vendorA)
                 .productCode("PM-EMPTY").productName("빈제품").unitPrice(9000L)
                 .status(VendorProductStatus.ACTIVE).build();
         ReflectionTestUtils.setField(vpA2, "id", 12L);
@@ -102,7 +102,6 @@ class PurchaseOrderCatalogServiceTest {
     void getCatalog_allVendors() {
         when(vendorProductRepository.findAllByStatusOrderByIdDesc(VendorProductStatus.ACTIVE))
                 .thenReturn(List.of(vpA1, vpB1));
-        when(vendorRepository.findAllById(any())).thenReturn(List.of(vendorA, vendorB));
         when(productMasterRepository.findAllByCodeIn(any())).thenReturn(List.of(pmA, pmB));
         when(productSkuRepository.findAllByProductCodeInOrderByIdAsc(any())).thenReturn(List.of(
                 sku("SKU-A-1", "PM-A", "화이트", "L", 6800L),
@@ -133,7 +132,6 @@ class PurchaseOrderCatalogServiceTest {
     void getCatalog_skipMastersWithoutSkus() {
         when(vendorProductRepository.findAllByStatusOrderByIdDesc(VendorProductStatus.ACTIVE))
                 .thenReturn(List.of(vpA1, vpA2));
-        when(vendorRepository.findAllById(any())).thenReturn(List.of(vendorA));
         when(productMasterRepository.findAllByCodeIn(any())).thenReturn(List.of(pmA, pmEmpty));
         when(productSkuRepository.findAllByProductCodeInOrderByIdAsc(any())).thenReturn(List.of(
                 sku("SKU-A-1", "PM-A", "화이트", "L", 6800L)
@@ -152,7 +150,6 @@ class PurchaseOrderCatalogServiceTest {
         when(vendorRepository.findByCode("VND-A")).thenReturn(java.util.Optional.of(vendorA));
         when(vendorProductRepository.findAllByVendorIdAndStatusNotOrderByIdDesc(1L, VendorProductStatus.DELETED))
                 .thenReturn(List.of(vpA1));
-        when(vendorRepository.findAllById(any())).thenReturn(List.of(vendorA));
         when(productMasterRepository.findAllByCodeIn(any())).thenReturn(List.of(pmA));
         when(productSkuRepository.findAllByProductCodeInOrderByIdAsc(any())).thenReturn(List.of(
                 sku("SKU-A-1", "PM-A", "화이트", "L", 6800L)
