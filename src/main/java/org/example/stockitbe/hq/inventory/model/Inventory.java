@@ -113,7 +113,7 @@ public class Inventory extends BaseEntity {
     }
 
     /**
-     * 발주 SHIPPING 진입 시 가용재고 증가 (이슈 #169 — 발주 ↔ 인벤토리 연결 룰).
+     * 본사 발주 SHIPPING 진입 시 가용재고 증가 (이슈 #169 — 발주 ↔ 인벤토리 연결 룰).
      * 도착 전 예약 가용재고로, 실재고(quantity) 는 변하지 않는다.
      */
     public void increaseAvailable(int delta) {
@@ -122,7 +122,7 @@ public class Inventory extends BaseEntity {
     }
 
     /**
-     * 발주 COMPLETED (입고 확정) 시 가용재고를 실재고로 이동.
+     * 본사 발주 COMPLETED (입고 확정) 시 가용재고를 실재고로 이동.
      * available_quantity -= delta, quantity += delta.
      */
     public void moveAvailableToPhysical(int delta) {
@@ -131,6 +131,7 @@ public class Inventory extends BaseEntity {
         this.lastMovementAt = new Date();
     }
 
+    // --------------- 매장 판매 관련 ----------------
     // 판매 가능 여부를 실재고(quantity) 기준으로 확인 (해당 수량을 팔 수 있는지 검사)
     public boolean canSell(int sellQuantity) {
         return sellQuantity > 0 && this.quantity >= sellQuantity;
@@ -141,6 +142,40 @@ public class Inventory extends BaseEntity {
         this.quantity -= sellQuantity;
         // 기존 화면 정합성을 위해 availableQuantity도 함께 감산하되 음수는 방지
         this.availableQuantity = Math.max(0, this.availableQuantity - sellQuantity);
+        this.lastMovementAt = new Date();
+    }
+
+    // ---------------- 매장 발주 관련 -----------------
+    // 발주 승인 시 출고지 창고 재고를 예약 처리
+    // 요청 수량만큼 예약하려고 시도하고, 실제 예약된 수량을 반환
+    public int reserveUpTo(int requestedQuantity) {
+        int safeRequested = Math.max(0, requestedQuantity);
+        int reservable = Math.max(0, n(this.availableQuantity));
+        int reserved = Math.min(safeRequested, reservable);
+        this.availableQuantity = n(this.availableQuantity) - reserved;
+        this.reservedQuantity = n(this.reservedQuantity) + reserved;
+        this.lastMovementAt = new Date();
+        return reserved;
+    }
+
+    // ------------- 물류 창고 출고 관련 ------------------
+    // 출고리스트에서 reserved로 잡힌 아이템을 출고 확정 시 InTransit 재고로 반영
+    public int moveReservedToInTransit(int requestedQuantity) {
+        int safeRequested = Math.max(0, requestedQuantity);
+        int movable = Math.max(0, n(this.reservedQuantity));
+        int moved = Math.min(safeRequested, movable);
+        this.reservedQuantity = n(this.reservedQuantity) - moved;
+        this.inTransitQuantity = n(this.inTransitQuantity) + moved;
+        this.lastMovementAt = new Date();
+        return moved;
+    }
+
+    // ------------- 매장 입고 확정 관련 ------------------
+    // 매장 입고 확정 시점에 실재고/가용재고를 동시에 증가시킨다.
+    public void increaseOnHandAndAvailable(int receivedQuantity) {
+        int safeReceived = Math.max(0, receivedQuantity);
+        this.quantity = n(this.quantity) + safeReceived;
+        this.availableQuantity = n(this.availableQuantity) + safeReceived;
         this.lastMovementAt = new Date();
     }
 }
