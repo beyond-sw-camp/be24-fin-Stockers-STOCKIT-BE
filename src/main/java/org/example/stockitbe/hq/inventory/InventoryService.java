@@ -34,6 +34,8 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+// 본사 재고 관리 서비스
+// 재고 전이, 순환재고 후보/확정 처리, 순환재고 조회 및 소재 단가 정책을 관리한다.
 public class InventoryService {
 
     private final InventoryRepository inventoryRepository;
@@ -75,189 +77,7 @@ public class InventoryService {
             MAT_BLEND, "혼방"
     );
 
-    @Transactional(readOnly = true)
-    public InventoryDto.CompanyWidePageRes findCompanyWide(LocationType locationType,
-                                                            List<Long> locationIds,
-                                                            String parentCategory,
-                                                            String childCategory,
-                                                            InventoryStatus status,
-                                                            String keyword) {
-        List<Inventory> inventories = inventoryRepository.findAll();
-        List<ProductSku> skus = productSkuRepository.findAll();
-        if (inventories.isEmpty() || skus.isEmpty()) {
-            return InventoryDto.CompanyWidePageRes.builder()
-                    .items(List.of())
-                    .locationOptions(buildLocationOptions(locationType))
-                    .build();
-        }
-
-        Map<Long, ProductSku> skuById = skus.stream().collect(Collectors.toMap(ProductSku::getId, Function.identity()));
-        Set<String> productCodes = skus.stream().map(ProductSku::getProductCode).collect(Collectors.toSet());
-        Map<String, ProductMaster> productByCode = productMasterRepository.findAllByCodeIn(productCodes).stream()
-                .collect(Collectors.toMap(ProductMaster::getCode, Function.identity()));
-
-        List<Category> categories = categoryRepository.findAllByOrderByIdAsc();
-        Map<String, Category> categoryByCode = categories.stream().collect(Collectors.toMap(Category::getCode, Function.identity()));
-        Map<Long, Category> categoryById = categories.stream().collect(Collectors.toMap(Category::getId, Function.identity()));
-
-        Map<Long, Infrastructure> locationById = infrastructureRepository.findAll().stream()
-                .collect(Collectors.toMap(Infrastructure::getId, Function.identity()));
-
-        String safeParent = parentCategory == null ? "" : parentCategory.trim();
-        String safeChild = childCategory == null ? "" : childCategory.trim();
-        String safeKeyword = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
-        Set<Long> locationIdSet = locationIds == null ? Set.of() : new HashSet<>(locationIds);
-
-        Map<String, Aggregate> aggregateMap = new LinkedHashMap<>();
-
-        for (Inventory inv : inventories) {
-            if (!InventoryStatusPolicy.QUERY_ALLOWED_STATUSES.contains(inv.getInventoryStatus())) continue;
-            ProductSku sku = skuById.get(inv.getSkuId());
-            if (sku == null) continue;
-            ProductMaster master = productByCode.get(sku.getProductCode());
-            if (master == null) continue;
-            Infrastructure location = locationById.get(inv.getLocationId());
-            if (location == null) continue;
-            if (locationType != null && location.getLocationType() != locationType) continue;
-            if (!locationIdSet.isEmpty() && !locationIdSet.contains(location.getId())) continue;
-            if (status != null && inv.getInventoryStatus() != status) continue;
-
-            Category child = categoryByCode.get(master.getCategoryCode());
-            if (child == null) continue;
-            Category parent = child.getParentId() == null ? child : categoryById.get(child.getParentId());
-
-            String parentName = parent != null ? parent.getName() : "";
-            String childName = child.getName();
-
-            if (!safeParent.isBlank() && !safeParent.equals(parentName)) continue;
-            if (!safeChild.isBlank() && !safeChild.equals(childName)) continue;
-
-            if (!safeKeyword.isBlank()) {
-                String searchable = String.join(" ",
-                        master.getCode(),
-                        master.getName(),
-                        sku.getSkuCode(),
-                        location.getCode(),
-                        location.getName()
-                ).toLowerCase(Locale.ROOT);
-                if (!searchable.contains(safeKeyword)) continue;
-            }
-
-            Aggregate agg = aggregateMap.computeIfAbsent(master.getCode(), k -> new Aggregate(master, parentName, childName));
-            agg.actualStock += n(inv.getQuantity());
-            agg.availableStock += n(inv.getAvailableQuantity());
-            String safetyKey = inv.getSkuId() + ":" + inv.getLocationId();
-            if (agg.safetyKeys.add(safetyKey)) {
-                agg.safetyStock += location.getLocationType() == LocationType.WAREHOUSE
-                        ? n(master.getWarehouseSafetyStock())
-                        : n(master.getStoreSafetyStock());
-            }
-            if (agg.updatedAt == null || inv.getUpdatedAt().after(agg.updatedAt)) {
-                agg.updatedAt = inv.getUpdatedAt();
-            }
-            agg.statuses.add(inv.getInventoryStatus());
-        }
-
-        List<InventoryDto.CompanyWideRes> items = aggregateMap.values().stream()
-                .map(agg -> InventoryDto.CompanyWideRes.builder()
-                        .itemCode(agg.master.getCode())
-                        .parentCategory(agg.parentCategory)
-                        .childCategory(agg.childCategory)
-                        .itemName(agg.master.getName())
-                        .actualStock(agg.actualStock)
-                        .availableStock(agg.availableStock)
-                        .safetyStock(agg.safetyStock)
-                        .status(toUiStatus(agg.availableStock, agg.safetyStock))
-                        .updatedAt(agg.updatedAt)
-                        .build())
-                .sorted(Comparator.comparing(InventoryDto.CompanyWideRes::getItemCode))
-                .toList();
-
-        return InventoryDto.CompanyWidePageRes.builder()
-                .items(items)
-                .locationOptions(buildLocationOptions(locationType))
-                .build();
-    }
-
-    @Transactional(readOnly = true)
-    public List<InventoryDto.CompanyWideSkuDetailRes> findCompanyWideSkuDetails(String itemCode,
-                                                                                 LocationType locationType,
-                                                                                 List<Long> locationIds,
-                                                                                 String parentCategory,
-                                                                                 String childCategory,
-                                                                                 InventoryStatus status,
-                                                                                 String keyword) {
-        if (itemCode == null || itemCode.isBlank()) return List.of();
-
-        List<ProductSku> productSkus = productSkuRepository.findByProductCodeOrderByIdDesc(itemCode.trim());
-        if (productSkus.isEmpty()) return List.of();
-
-        Set<Long> skuIds = productSkus.stream().map(ProductSku::getId).collect(Collectors.toSet());
-        List<Inventory> inventories = inventoryRepository.findAllBySkuIdIn(skuIds);
-
-        Map<Long, Infrastructure> locationById = infrastructureRepository.findAll().stream()
-                .collect(Collectors.toMap(Infrastructure::getId, Function.identity()));
-        Set<Long> locationIdSet = locationIds == null ? Set.of() : new HashSet<>(locationIds);
-        String safeKeyword = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
-
-        ProductMaster master = productMasterRepository.findByCode(itemCode.trim()).orElse(null);
-        int warehouseSafety = master == null ? 0 : n(master.getWarehouseSafetyStock());
-        int storeSafety = master == null ? 0 : n(master.getStoreSafetyStock());
-
-        Map<Long, SkuAggregate> skuMap = new LinkedHashMap<>();
-        for (ProductSku sku : productSkus) {
-            skuMap.put(sku.getId(), new SkuAggregate(sku));
-        }
-
-        for (Inventory inv : inventories) {
-            if (!InventoryStatusPolicy.QUERY_ALLOWED_STATUSES.contains(inv.getInventoryStatus())) continue;
-            Infrastructure location = locationById.get(inv.getLocationId());
-            if (location == null) continue;
-            if (locationType != null && location.getLocationType() != locationType) continue;
-            if (!locationIdSet.isEmpty() && !locationIdSet.contains(location.getId())) continue;
-            if (status != null && inv.getInventoryStatus() != status) continue;
-
-            if (!safeKeyword.isBlank()) {
-                ProductSku sku = skuMap.get(inv.getSkuId()).sku;
-                String searchable = String.join(" ", sku.getSkuCode(), sku.getColor(), sku.getSize(), location.getName())
-                        .toLowerCase(Locale.ROOT);
-                if (!searchable.contains(safeKeyword)) continue;
-            }
-
-            SkuAggregate agg = skuMap.get(inv.getSkuId());
-            if (agg == null) continue;
-            agg.actualStock += n(inv.getQuantity());
-            agg.availableStock += n(inv.getAvailableQuantity());
-            String safetyKey = inv.getSkuId() + ":" + inv.getLocationId();
-            if (agg.safetyKeys.add(safetyKey)) {
-                agg.safetyStock += location.getLocationType() == LocationType.WAREHOUSE
-                        ? warehouseSafety
-                        : storeSafety;
-            }
-            if (agg.updatedAt == null || inv.getUpdatedAt().after(agg.updatedAt)) {
-                agg.updatedAt = inv.getUpdatedAt();
-            }
-        }
-
-        return skuMap.values().stream()
-                .filter(agg -> agg.actualStock > 0 || agg.availableStock > 0)
-                .map(agg -> {
-                    return InventoryDto.CompanyWideSkuDetailRes.builder()
-                            .skuCode(agg.sku.getSkuCode())
-                            .color(agg.sku.getColor())
-                            .size(agg.sku.getSize())
-                            .unitPrice(agg.sku.getUnitPrice())
-                            .actualStock(agg.actualStock)
-                            .availableStock(agg.availableStock)
-                            .safetyStock(agg.safetyStock)
-                            .status(toUiStatus(agg.availableStock, agg.safetyStock))
-                            .updatedAt(agg.updatedAt)
-                            .build();
-                })
-                .sorted(Comparator.comparing(InventoryDto.CompanyWideSkuDetailRes::getSkuCode))
-                .toList();
-    }
-
+    // 전사 재고 불균형 SKU를 계산해 반환한다.
     @Transactional(readOnly = true)
     public List<InventoryDto.ImbalancedSkuRes> findImbalancedSkus() {
         List<Inventory> inventories = inventoryRepository.findAll();
@@ -333,18 +153,15 @@ public class InventoryService {
                             ? ""
                             : (parent == null ? child.getName() : parent.getName() + " > " + child.getName());
 
-                    return InventoryDto.ImbalancedSkuRes.builder()
-                            .skuCode(agg.sku.getSkuCode())
-                            .itemCode(agg.master.getCode())
-                            .itemName(agg.master.getName())
-                            .color(agg.sku.getColor())
-                            .size(agg.sku.getSize())
-                            .category(categoryLabel)
-                            .totalOnHand(agg.totalOnHand)
-                            .totalAvailable(agg.totalAvailable)
-                            .shortageWarehouseCount(agg.shortageWarehouseCount)
-                            .totalShortageQty(agg.totalShortageQty)
-                            .build();
+                    return InventoryDto.ImbalancedSkuRes.from(
+                            agg.sku,
+                            agg.master,
+                            categoryLabel,
+                            agg.totalOnHand,
+                            agg.totalAvailable,
+                            agg.shortageWarehouseCount,
+                            agg.totalShortageQty
+                    );
                 })
                 .sorted(
                         Comparator.comparing(InventoryDto.ImbalancedSkuRes::getShortageWarehouseCount, Comparator.reverseOrder())
@@ -354,8 +171,9 @@ public class InventoryService {
                 .toList();
     }
 
-    // 특정 창고(locationId)의 특정 SKU(skuId)를 락 잡고 예약 가능한 만큼 예약 (매장 발주 승인 관련)
-    // 반환 값: 실제 예약된 수량
+    // -------- 재고 전이/후킹 --------
+
+    /** 특정 창고 SKU를 락으로 조회해 요청 수량만큼 출고 예약한다. */
     @Transactional
     public int reserveForOutboundUpTo(Long locationId, Long skuId, int requestedQuantity) {
         if (locationId == null || skuId == null || requestedQuantity <= 0) return 0;
@@ -470,57 +288,8 @@ public class InventoryService {
                 );
     }
 
-    private List<InventoryDto.LocationOptionRes> buildLocationOptions(LocationType locationType) {
-        return infrastructureRepository.findAll().stream()
-                .filter(i -> locationType == null || i.getLocationType() == locationType)
-                .sorted(Comparator.comparing(Infrastructure::getName))
-                .map(i -> InventoryDto.LocationOptionRes.builder()
-                        .id(i.getId())
-                        .code(i.getCode())
-                        .name(i.getName())
-                        .build())
-                .toList();
-    }
-
     private int n(Integer value) {
         return value == null ? 0 : value;
-    }
-
-    private String toUiStatus(int available, int safety) {
-        if (available <= 0) return "품절";
-        if (available < safety) return "부족";
-        return "정상";
-    }
-
-    private static class Aggregate {
-        private final ProductMaster master;
-        private final String parentCategory;
-        private final String childCategory;
-        private int actualStock = 0;
-        private int availableStock = 0;
-        private int safetyStock = 0;
-        private Date updatedAt;
-        private final Set<InventoryStatus> statuses = new HashSet<>();
-        private final Set<String> safetyKeys = new HashSet<>();
-
-        private Aggregate(ProductMaster master, String parentCategory, String childCategory) {
-            this.master = master;
-            this.parentCategory = parentCategory;
-            this.childCategory = childCategory;
-        }
-    }
-
-    private static class SkuAggregate {
-        private final ProductSku sku;
-        private int actualStock = 0;
-        private int availableStock = 0;
-        private int safetyStock = 0;
-        private Date updatedAt;
-        private final Set<String> safetyKeys = new HashSet<>();
-
-        private SkuAggregate(ProductSku sku) {
-            this.sku = sku;
-        }
     }
 
     private static class ImbalancedSkuAggregate {
@@ -547,6 +316,9 @@ public class InventoryService {
         }
     }
 
+    // -------- 순환재고 후보 리프레시 --------
+
+    // 순환재고 후보 조건을 재평가하고 대상 재고를 후보 상태로 전환한다.
     @Transactional
     public InventoryDto.CircularCandidateRefreshRes refreshCircularCandidates() {
         Map<Long, Infrastructure> warehouseById = infrastructureRepository.findAll().stream()
@@ -649,6 +421,9 @@ public class InventoryService {
                 .build();
     }
 
+    // -------- 순환재고 조회 --------
+
+    // 순환재고 후보 목록을 필터/정렬/페이지 조건으로 조회한다.
     @Transactional(readOnly = true)
     public InventoryDto.CircularCandidatePageRes findCircularCandidates(Integer page,
                                                                          Integer size,
@@ -725,23 +500,20 @@ public class InventoryService {
                     List<Integer> matchedCodes = conditionCodesByInventoryId.getOrDefault(inv.getId(), List.of());
                     int convertibleStock = calculateConvertibleStock(inv);
 
-                    return InventoryDto.CircularCandidateRes.builder()
-                            .inventoryId(inv.getId())
-                            .skuCode(sku.getSkuCode())
-                            .itemCode(master.getCode())
-                            .parentCategory(parent != null ? parent.getName() : "")
-                            .childCategory(child.getName())
-                            .itemName(master.getName())
-                            .warehouseCode(warehouse.getCode())
-                            .warehouseName(warehouse.getName())
-                            .color(sku.getColor())
-                            .size(sku.getSize())
-                            .actualStock(n(inv.getQuantity()))
-                            .availableStock(n(inv.getAvailableQuantity()))
-                            .convertibleStock(convertibleStock)
-                            .updatedAt(inv.getUpdatedAt())
-                            .matchedConditionCodes(matchedCodes.stream().sorted().toList())
-                            .build();
+                    return InventoryDto.CircularCandidateRes.from(
+                            inv.getId(),
+                            sku,
+                            master,
+                            parent != null ? parent.getName() : "",
+                            child.getName(),
+                            warehouse.getCode(),
+                            warehouse.getName(),
+                            n(inv.getQuantity()),
+                            n(inv.getAvailableQuantity()),
+                            convertibleStock,
+                            inv.getUpdatedAt(),
+                            matchedCodes.stream().sorted().toList()
+                    );
                 })
                 .filter(Objects::nonNull)
                 .toList();
@@ -757,6 +529,7 @@ public class InventoryService {
         return buildCircularCandidatePage(filtered, safePage, safeSize, filtered.size());
     }
 
+    // 순환재고 확정 목록을 필터/정렬/페이지 조건으로 조회한다.
     @Transactional(readOnly = true)
     public InventoryDto.CircularInventoryPageRes findCircularInventories(Integer page,
                                                                          Integer size,
@@ -830,25 +603,22 @@ public class InventoryService {
                     int materialKgPrice = resolveMaterialKgPrice(materialCompositions, materialByCode, materialPriceByCode);
                     long circularSalePrice = Math.round(totalWeightKg * materialKgPrice);
 
-                    return InventoryDto.CircularInventoryRes.builder()
-                            .inventoryId(inv.getId())
-                            .skuCode(sku.getSkuCode())
-                            .itemCode(master.getCode())
-                            .itemName(master.getName())
-                            .warehouseCode(warehouse.getCode())
-                            .warehouseName(warehouse.getName())
-                            .parentCategory(parent == null ? "" : parent.getName())
-                            .childCategory(child.getName())
-                            .color(sku.getColor())
-                            .size(sku.getSize())
-                            .availableQuantity(availableQuantity)
-                            .materialType(materialType)
-                            .materialCompositions(compositions)
-                            .materialKgPrice(materialKgPrice)
-                            .unitWeightKg(unitWeightKg)
-                            .totalWeightKg(totalWeightKg)
-                            .circularSalePrice(circularSalePrice)
-                            .build();
+                    return InventoryDto.CircularInventoryRes.from(
+                            inv.getId(),
+                            sku,
+                            master,
+                            warehouse.getCode(),
+                            warehouse.getName(),
+                            parent == null ? "" : parent.getName(),
+                            child.getName(),
+                            availableQuantity,
+                            materialType,
+                            compositions,
+                            materialKgPrice,
+                            unitWeightKg,
+                            totalWeightKg,
+                            circularSalePrice
+                    );
                 })
                 .filter(Objects::nonNull)
                 .toList();
@@ -863,6 +633,7 @@ public class InventoryService {
         return buildCircularInventoryPage(filtered, safePage, safeSize, filtered.size());
     }
 
+    // 순환재고 페이지 응답 객체를 생성한다.
     private InventoryDto.CircularInventoryPageRes buildCircularInventoryPage(List<InventoryDto.CircularInventoryRes> rows,
                                                                              int page,
                                                                              int size,
@@ -872,18 +643,18 @@ public class InventoryService {
         List<InventoryDto.CircularInventoryRes> content = rows.subList(from, to);
         Pageable pageable = org.springframework.data.domain.PageRequest.of(page, size);
         PageImpl<InventoryDto.CircularInventoryRes> result = new PageImpl<>(content, pageable, totalElements);
-
-        return InventoryDto.CircularInventoryPageRes.builder()
-                .content(result.getContent())
-                .page(result.getNumber())
-                .size(result.getSize())
-                .totalElements(result.getTotalElements())
-                .totalPages(result.getTotalPages())
-                .hasNext(result.hasNext())
-                .hasPrevious(result.hasPrevious())
-                .build();
+        return InventoryDto.CircularInventoryPageRes.from(
+                result.getContent(),
+                result.getNumber(),
+                result.getSize(),
+                result.getTotalElements(),
+                result.getTotalPages(),
+                result.hasNext(),
+                result.hasPrevious()
+        );
     }
 
+    // 순환재고 후보 페이지 응답 객체를 생성한다.
     private InventoryDto.CircularCandidatePageRes buildCircularCandidatePage(List<InventoryDto.CircularCandidateRes> rows,
                                                                               int page,
                                                                               int size,
@@ -893,24 +664,25 @@ public class InventoryService {
         List<InventoryDto.CircularCandidateRes> content = rows.subList(from, to);
         Pageable pageable = org.springframework.data.domain.PageRequest.of(page, size);
         PageImpl<InventoryDto.CircularCandidateRes> result = new PageImpl<>(content, pageable, totalElements);
-
-        return InventoryDto.CircularCandidatePageRes.builder()
-                .content(result.getContent())
-                .page(result.getNumber())
-                .size(result.getSize())
-                .totalElements(result.getTotalElements())
-                .totalPages(result.getTotalPages())
-                .hasNext(result.hasNext())
-                .hasPrevious(result.hasPrevious())
-                .build();
+        return InventoryDto.CircularCandidatePageRes.from(
+                result.getContent(),
+                result.getNumber(),
+                result.getSize(),
+                result.getTotalElements(),
+                result.getTotalPages(),
+                result.hasNext(),
+                result.hasPrevious()
+        );
     }
 
+    // 요청 페이지 크기를 허용 값(20/50/100)으로 정규화한다.
     private int normalizePageSize(Integer size) {
         int requested = size == null ? 20 : size;
         if (requested == 50 || requested == 100) return requested;
         return 20;
     }
 
+    // 순환재고 정렬 파라미터를 Sort 스펙으로 변환한다.
     private Sort parseCircularSort(String sort) {
         String normalized = sort == null ? "" : sort.trim();
         if (normalized.isBlank()) return Sort.by(Sort.Order.asc("skuCode"));
@@ -925,6 +697,7 @@ public class InventoryService {
         return Sort.by(new Sort.Order(dir, field));
     }
 
+    // 순환재고 후보 정렬 파라미터를 Sort 스펙으로 변환한다.
     private Sort parseCandidateSort(String sort) {
         String normalized = sort == null ? "" : sort.trim();
         if (normalized.isBlank()) return Sort.by(Sort.Order.desc("convertibleStock"));
@@ -939,6 +712,7 @@ public class InventoryService {
         return Sort.by(new Sort.Order(dir, field));
     }
 
+    // 순환재고 목록 정렬 Comparator를 생성한다.
     private Comparator<InventoryDto.CircularInventoryRes> buildCircularComparator(Sort sortSpec) {
         Sort.Order order = sortSpec.stream().findFirst().orElse(Sort.Order.asc("skuCode"));
         Comparator<InventoryDto.CircularInventoryRes> comparator;
@@ -967,12 +741,13 @@ public class InventoryService {
         return comparator.thenComparing(row -> row.getSkuCode() == null ? "" : row.getSkuCode());
     }
 
+    // 순환재고 후보 목록 정렬 Comparator를 생성한다.
     private Comparator<InventoryDto.CircularCandidateRes> buildCandidateComparator(Sort sortSpec) {
         Sort.Order order = sortSpec.stream().findFirst().orElse(Sort.Order.desc("convertibleStock"));
         Comparator<InventoryDto.CircularCandidateRes> comparator;
         switch (order.getProperty()) {
             case "skuCode":
-                comparator = Comparator.comparing(row -> safeText(row.getSkuCode()));
+                comparator = Comparator.comparing(row -> row.getSkuCode() == null ? "" : row.getSkuCode());
                 break;
             case "availableStock":
                 comparator = Comparator.comparing(row -> n(row.getAvailableStock()));
@@ -986,39 +761,37 @@ public class InventoryService {
                 break;
         }
         if (order.getDirection() == Sort.Direction.DESC) comparator = comparator.reversed();
-        return comparator.thenComparing(row -> safeText(row.getSkuCode()));
+        return comparator.thenComparing(row -> row.getSkuCode() == null ? "" : row.getSkuCode());
     }
 
+    // 순환재고 키워드 검색 조건 일치 여부를 판단한다.
     private boolean matchesCircularKeyword(InventoryDto.CircularInventoryRes row, String keyword) {
         if (keyword == null || keyword.isBlank()) return true;
         String materialDetail = row.getMaterialCompositions() == null
                 ? ""
                 : row.getMaterialCompositions().stream()
-                .map(comp -> (comp.getMaterialNameKo() == null ? "" : comp.getMaterialNameKo()) + " " + n(comp.getRatio()) + "%")
+                .map(comp -> safeText(comp.getMaterialNameKo()) + " " + n(comp.getRatio()) + "%")
                 .collect(Collectors.joining(" + "));
-        String searchable = String.join(" ",
-                safeText(row.getItemCode()),
-                safeText(row.getItemName()),
-                materialDetail
-        ).toLowerCase(Locale.ROOT);
+        String searchable = String.join(" ", safeText(row.getItemCode()), safeText(row.getItemName()), materialDetail)
+                .toLowerCase(Locale.ROOT);
         return searchable.contains(keyword);
     }
 
+    // 순환재고 창고코드 필터 일치 여부를 판단한다.
     private boolean matchesWarehouseCodes(InventoryDto.CircularInventoryRes row, Set<String> warehouseCodes) {
         if (warehouseCodes == null || warehouseCodes.isEmpty()) return true;
         return warehouseCodes.contains(safeText(row.getWarehouseCode()).toUpperCase(Locale.ROOT));
     }
 
+    // 후보 키워드 검색 조건 일치 여부를 판단한다.
     private boolean matchesCandidateKeyword(InventoryDto.CircularCandidateRes row, String keyword) {
         if (keyword == null || keyword.isBlank()) return true;
-        String searchable = String.join(" ",
-                safeText(row.getSkuCode()),
-                safeText(row.getItemCode()),
-                safeText(row.getItemName())
-        ).toLowerCase(Locale.ROOT);
+        String searchable = String.join(" ", safeText(row.getSkuCode()), safeText(row.getItemCode()), safeText(row.getItemName()))
+                .toLowerCase(Locale.ROOT);
         return searchable.contains(keyword);
     }
 
+    // 후보 카테고리 필터 일치 여부를 판단한다.
     private boolean matchesCandidateCategory(InventoryDto.CircularCandidateRes row, String parentCategory, String childCategory) {
         if (parentCategory != null && !parentCategory.isBlank() && !parentCategory.equals(safeText(row.getParentCategory()))) {
             return false;
@@ -1029,17 +802,20 @@ public class InventoryService {
         return true;
     }
 
+    // 후보 창고 필터 일치 여부를 판단한다.
     private boolean matchesCandidateWarehouse(InventoryDto.CircularCandidateRes row, Set<String> warehouseCodes) {
         if (warehouseCodes == null || warehouseCodes.isEmpty()) return true;
         return warehouseCodes.contains(safeText(row.getWarehouseCode()).toUpperCase(Locale.ROOT));
     }
 
+    // 후보 조건코드 필터 일치 여부를 판단한다.
     private boolean matchesCandidateConditionCodes(InventoryDto.CircularCandidateRes row, Set<Integer> conditionCodes) {
         if (conditionCodes == null || conditionCodes.isEmpty()) return true;
         List<Integer> matched = row.getMatchedConditionCodes() == null ? List.of() : row.getMatchedConditionCodes();
         return conditionCodes.stream().allMatch(matched::contains);
     }
 
+    // 순환재고 소재 필터 일치 여부를 판단한다.
     private boolean matchesMaterialFilter(InventoryDto.CircularInventoryRes row,
                                           String materialGroup,
                                           String materialName,
@@ -1055,10 +831,12 @@ public class InventoryService {
         );
     }
 
+    // null-safe 문자열 변환
     private String safeText(String value) {
         return value == null ? "" : value;
     }
 
+    // 소재명 별칭을 표준 한글명으로 정규화한다.
     private String normalizeMaterialName(String value) {
         String normalized = value == null ? "" : value.trim();
         String lower = normalized.toLowerCase(Locale.ROOT);
@@ -1076,14 +854,18 @@ public class InventoryService {
         };
     }
 
+    // -------- 순환재고 단가 정책 --------
+
+    // 소재 단가 정책 목록을 조회한다.
     @Transactional(readOnly = true)
     public List<InventoryDto.CircularMaterialPriceRes> findCircularMaterialPrices() {
         return circularMaterialPricePolicyRepository.findAll().stream()
                 .sorted(Comparator.comparing(CircularMaterialPricePolicy::getMaterialCode))
-                .map(this::toCircularMaterialPriceRes)
+                .map(InventoryDto.CircularMaterialPriceRes::from)
                 .toList();
     }
 
+    // 소재 코드 기준 단가 정책을 수정한다.
     @Transactional
     public InventoryDto.CircularMaterialPriceRes updateCircularMaterialPrice(
             String materialCode,
@@ -1093,18 +875,16 @@ public class InventoryService {
         CircularMaterialPricePolicy policy = circularMaterialPricePolicyRepository.findById(key)
                 .orElseThrow(() -> BaseException.from(BaseResponseStatus.NOT_FOUND_DATA));
         policy.updatePrice(request.getPricePerKg());
-        return toCircularMaterialPriceRes(policy);
+        return InventoryDto.CircularMaterialPriceRes.from(policy);
     }
 
+    // -------- 후보 -> 순환재고 전환 --------
+
+    // 순환재고 후보를 요청 수량만큼 순환재고로 전환한다.
     @Transactional
     public InventoryDto.CircularCandidateConvertRes convertCircularCandidates(List<InventoryDto.CircularCandidateConvertItemReq> requests) {
         if (requests == null || requests.isEmpty()) {
-            return InventoryDto.CircularCandidateConvertRes.builder()
-                    .requestedCount(0)
-                    .convertedCount(0)
-                    .skippedCount(0)
-                    .items(List.of())
-                    .build();
+            return InventoryDto.CircularCandidateConvertRes.from(0, 0, List.of());
         }
 
         Map<Long, Infrastructure> warehouseById = infrastructureRepository.findAll().stream()
@@ -1120,54 +900,29 @@ public class InventoryService {
             int requested = request.getConvertQuantity() == null ? 0 : request.getConvertQuantity();
 
             if (inventoryId == null || requested <= 0) {
-                results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                        .inventoryId(inventoryId)
-                        .requested(requested)
-                        .converted(0)
-                        .reason("유효하지 않은 전환 수량입니다.")
-                        .build());
+                results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, 0, "유효하지 않은 전환 수량입니다."));
                 continue;
             }
 
             Optional<Inventory> sourceOpt = inventoryRepository.findWithLockById(inventoryId);
             if (sourceOpt.isEmpty()) {
-                results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                        .inventoryId(inventoryId)
-                        .requested(requested)
-                        .converted(0)
-                        .reason("재고를 찾을 수 없습니다.")
-                        .build());
+                results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, 0, "재고를 찾을 수 없습니다."));
                 continue;
             }
 
             Inventory source = sourceOpt.get();
             if (source.getInventoryStatus() != InventoryStatus.CIRCULAR_CANDIDATE) {
-                results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                        .inventoryId(inventoryId)
-                        .requested(requested)
-                        .converted(0)
-                        .reason("순환 재고 후보 상태가 아닙니다.")
-                        .build());
+                results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, 0, "순환 재고 후보 상태가 아닙니다."));
                 continue;
             }
             if (!warehouseById.containsKey(source.getLocationId())) {
-                results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                        .inventoryId(inventoryId)
-                        .requested(requested)
-                        .converted(0)
-                        .reason("창고 재고만 전환할 수 있습니다.")
-                        .build());
+                results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, 0, "창고 재고만 전환할 수 있습니다."));
                 continue;
             }
 
             int available = Math.max(0, n(source.getAvailableQuantity()));
             if (requested > available) {
-                results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                        .inventoryId(inventoryId)
-                        .requested(requested)
-                        .converted(0)
-                        .reason("전환 가능 재고를 초과했습니다.")
-                        .build());
+                results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, 0, "전환 가능 재고를 초과했습니다."));
                 continue;
             }
 
@@ -1203,24 +958,15 @@ public class InventoryService {
             inventoryRepository.save(target);
 
             convertedCount += 1;
-            results.add(InventoryDto.CircularCandidateConvertItemRes.builder()
-                    .inventoryId(inventoryId)
-                    .requested(requested)
-                    .converted(requested)
-                    .reason("SUCCESS")
-                    .build());
+            results.add(InventoryDto.CircularCandidateConvertItemRes.from(inventoryId, requested, requested, "SUCCESS"));
         }
 
-        int requestedCount = requests.size();
-        int skippedCount = requestedCount - convertedCount;
-        return InventoryDto.CircularCandidateConvertRes.builder()
-                .requestedCount(requestedCount)
-                .convertedCount(convertedCount)
-                .skippedCount(skippedCount)
-                .items(results)
-                .build();
+        return InventoryDto.CircularCandidateConvertRes.from(requests.size(), convertedCount, results);
     }
 
+    // -------- 후보 판정/소재 계산 보조 메서드 --------
+
+    // 후보 판정 조건 코드를 계산한다.
     private List<Integer> evaluateCandidateConditions(Inventory inventory, ProductSku sku,
                                                       ProductMaster master,
                                                       Map<String, GroupAvailabilityAggregate> groupAvailability) {
@@ -1247,6 +993,7 @@ public class InventoryService {
         return matchedCodes;
     }
 
+    // 상품+위치 단위 가용재고 집계를 생성한다.
     private Map<String, GroupAvailabilityAggregate> buildGroupAvailability(List<Inventory> inventories,
                                                                            Map<Long, ProductSku> skuById) {
         Map<String, GroupAvailabilityAggregate> grouped = new HashMap<>();
@@ -1266,6 +1013,7 @@ public class InventoryService {
         return grouped;
     }
 
+    // 동일 상품/위치 내 사이즈 점유율을 계산한다.
     private double calculateSizeShare(Inventory inventory, ProductSku sku,
                                       Map<String, GroupAvailabilityAggregate> groupAvailability) {
         String groupKey = buildGroupKey(sku.getProductCode(), inventory.getLocationId());
@@ -1276,6 +1024,7 @@ public class InventoryService {
         return (double) matched / aggregate.totalAvailable;
     }
 
+    // 동일 상품/위치 내 컬러 점유율을 계산한다.
     private double calculateColorShare(Inventory inventory, ProductSku sku,
                                        Map<String, GroupAvailabilityAggregate> groupAvailability) {
         String groupKey = buildGroupKey(sku.getProductCode(), inventory.getLocationId());
@@ -1286,24 +1035,29 @@ public class InventoryService {
         return (double) matched / aggregate.totalAvailable;
     }
 
+    // null-safe 토큰 정규화
     private String normalizeToken(String value) {
         return value == null ? "" : value.trim().toUpperCase(Locale.ROOT);
     }
 
+    // 상품코드+위치 기반 그룹 키를 생성한다.
     private String buildGroupKey(String productCode, Long locationId) {
         return (productCode == null ? "" : productCode.trim()) + "::" + (locationId == null ? 0L : locationId);
     }
 
+    // 전환 가능한 재고 수량을 계산한다.
     private int calculateConvertibleStock(Inventory inventory) {
         return Math.max(0, n(inventory.getAvailableQuantity()));
     }
 
+    // 기준일로부터 경과 일수를 계산한다.
     private long daysSince(Date date) {
         if (date == null) return Long.MAX_VALUE;
         long millis = System.currentTimeMillis() - date.getTime();
         return millis < 0 ? 0 : millis / (1000L * 60 * 60 * 24);
     }
 
+    // 조건 코드의 표시 라벨을 반환한다.
     private String conditionLabel(Integer code) {
         if (code == null) return "";
         return switch (code) {
@@ -1314,26 +1068,19 @@ public class InventoryService {
         };
     }
 
+    // 활성 소재 단가 맵을 로딩한다.
     private Map<String, Integer> loadActiveMaterialPriceByCode() {
         return circularMaterialPricePolicyRepository.findAllByActiveTrueOrderByMaterialCodeAsc().stream()
                 .collect(Collectors.toMap(CircularMaterialPricePolicy::getMaterialCode, CircularMaterialPricePolicy::getPricePerKg));
     }
 
-    private InventoryDto.CircularMaterialPriceRes toCircularMaterialPriceRes(CircularMaterialPricePolicy policy) {
-        return InventoryDto.CircularMaterialPriceRes.builder()
-                .materialCode(policy.getMaterialCode())
-                .materialNameKo(policy.getMaterialNameKo())
-                .materialGroup(policy.getMaterialGroup())
-                .pricePerKg(policy.getPricePerKg())
-                .active(policy.getActive())
-                .build();
-    }
-
+    // 카테고리별 단위 중량(kg)을 해석한다.
     private double resolveCategoryUnitWeightKg(String childCategoryName) {
         if (childCategoryName == null) return DEFAULT_UNIT_WEIGHT_KG;
         return CATEGORY_UNIT_WEIGHT_KG.getOrDefault(childCategoryName.trim(), DEFAULT_UNIT_WEIGHT_KG);
     }
 
+    // 소재 구성을 기반으로 소재 유형 라벨을 결정한다.
     private String resolveMaterialTypeLabel(List<ProductMaterialComposition> compositions, Map<String, Material> materialByCode) {
         ProductMaterialType type = deriveMaterialType(compositions, materialByCode);
         if (type == ProductMaterialType.NATURAL_SINGLE) return "천연 단일 섬유";
@@ -1341,6 +1088,7 @@ public class InventoryService {
         return "혼방";
     }
 
+    // 소재 구성 엔티티를 응답 DTO로 변환한다.
     private List<InventoryDto.MaterialCompositionRes> toMaterialCompositionRes(List<ProductMaterialComposition> compositions,
                                                                                 Map<String, Material> materialByCode) {
         if (compositions == null) return List.of();
@@ -1357,6 +1105,7 @@ public class InventoryService {
                 .toList();
     }
 
+    // 소재 구성에 따른 kg 단가를 계산한다.
     private int resolveMaterialKgPrice(List<ProductMaterialComposition> compositions,
                                        Map<String, Material> materialByCode,
                                        Map<String, Integer> materialPriceByCode) {
@@ -1372,6 +1121,7 @@ public class InventoryService {
         return materialPriceByCode.getOrDefault(code, materialPriceByCode.getOrDefault(MAT_BLEND, 1000));
     }
 
+    // 소재 구성으로 상품 소재 유형을 판정한다.
     private ProductMaterialType deriveMaterialType(List<ProductMaterialComposition> compositions, Map<String, Material> materialByCode) {
         if (compositions == null || compositions.isEmpty()) return ProductMaterialType.BLEND;
         if (compositions.size() >= 2) return ProductMaterialType.BLEND;
@@ -1388,6 +1138,7 @@ public class InventoryService {
         return ProductMaterialType.BLEND;
     }
 
+    // 소재 코드의 한글명을 조회한다.
     private String resolveMaterialName(String code, Map<String, Material> materialByCode) {
         Material material = materialByCode.get(code);
         if (material == null || material.getNameKo() == null || material.getNameKo().isBlank()) {
@@ -1396,6 +1147,7 @@ public class InventoryService {
         return material.getNameKo();
     }
 
+    // 소수점 셋째 자리 반올림
     private double round3(double value) {
         return Math.round(value * 1000d) / 1000d;
     }

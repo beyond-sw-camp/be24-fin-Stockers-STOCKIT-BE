@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class StoreInventoryService {
+    private static final List<String> MAIN_CATEGORY_ORDER = List.of("상의", "바지", "치마", "아우터");
 
     private final InfrastructureRepository infrastructureRepository;
     private final InventoryRepository inventoryRepository;
@@ -33,6 +34,8 @@ public class StoreInventoryService {
     private final ProductMasterRepository productMasterRepository;
     private final CategoryRepository categoryRepository;
 
+    // 매장 재고 품목 목록 조회
+    // 품목 단위로 실재고/가용재고/안전재고를 집계해 반환한다.
     @Transactional(readOnly = true)
     public List<StoreInventoryDto.ItemRes> getItems(String locationCode) {
         Infrastructure store = resolveStore(locationCode);
@@ -82,17 +85,17 @@ public class StoreInventoryService {
         grouped.values().forEach(acc -> acc.safetyStock = acc.skuIds.size() * n(context.masterByCode.get(acc.itemCode).getStoreSafetyStock()));
 
         return grouped.values().stream()
-                .map(acc -> StoreInventoryDto.ItemRes.builder()
-                        .itemCode(acc.itemCode)
-                        .parentCategory(acc.parentCategory)
-                        .childCategory(acc.childCategory)
-                        .itemName(acc.itemName)
-                        .actualStock(acc.actualStock)
-                        .availableStock(acc.availableStock)
-                        .safetyStock(acc.safetyStock)
-                        .status(resolveStatus(acc.actualStock, acc.safetyStock))
-                        .updatedAt(acc.updatedAt)
-                        .build())
+                .map(acc -> StoreInventoryDto.ItemRes.from(
+                        acc.itemCode,
+                        acc.parentCategory,
+                        acc.childCategory,
+                        acc.itemName,
+                        acc.actualStock,
+                        acc.availableStock,
+                        acc.safetyStock,
+                        resolveStatus(acc.actualStock, acc.safetyStock),
+                        acc.updatedAt
+                ))
                 .sorted(Comparator
                         .comparing(StoreInventoryDto.ItemRes::getParentCategory, this::compareMainCategory)
                         .thenComparing(StoreInventoryDto.ItemRes::getChildCategory, Comparator.nullsLast(String::compareTo))
@@ -100,6 +103,8 @@ public class StoreInventoryService {
                 .toList();
     }
 
+    // 매장 재고 SKU 목록 조회
+    // 선택 품목(itemCode) 내 SKU 단위 재고를 조회한다.
     @Transactional(readOnly = true)
     public List<StoreInventoryDto.SkuRes> getItemSkus(String locationCode, String itemCode) {
         Infrastructure store = resolveStore(locationCode);
@@ -124,22 +129,24 @@ public class StoreInventoryService {
         }
 
         return grouped.values().stream()
-                .map(acc -> StoreInventoryDto.SkuRes.builder()
-                        .skuCode(acc.skuCode)
-                        .color(acc.color)
-                        .size(acc.size)
-                        .actualStock(acc.actualStock)
-                        .availableStock(acc.availableStock)
-                        .safetyStock(acc.safetyStock)
-                        .status(resolveStatus(acc.actualStock, acc.safetyStock))
-                        .updatedAt(acc.updatedAt)
-                        .build())
+                .map(acc -> StoreInventoryDto.SkuRes.from(
+                        acc.skuCode,
+                        acc.color,
+                        acc.size,
+                        acc.actualStock,
+                        acc.availableStock,
+                        acc.safetyStock,
+                        resolveStatus(acc.actualStock, acc.safetyStock),
+                        acc.updatedAt
+                ))
                 .sorted(Comparator
                         .comparing(StoreInventoryDto.SkuRes::getColor, Comparator.nullsLast(String::compareTo))
                         .thenComparing(StoreInventoryDto.SkuRes::getSize, Comparator.nullsLast(String::compareTo)))
                 .toList();
     }
 
+    // 단일 재고 행을 SKU 응답 DTO로 변환한다.
+    // itemCode와 일치하지 않으면 null을 반환한다.
     private StoreInventoryDto.SkuRes toSkuRes(Inventory inventory, String itemCode, Context context) {
         ProductSku sku = context.skuById.get(inventory.getSkuId());
         if (sku == null) return null;
@@ -150,7 +157,6 @@ public class StoreInventoryService {
         Category child = context.categoryByCode.get(master.getCategoryCode());
         if (child == null) return null;
 
-        Category parent = child.getParentId() == null ? child : context.categoryById.get(child.getParentId());
         String resolvedItemCode = master.getCode();
 
         if (!Objects.equals(resolvedItemCode, itemCode)) {
@@ -159,18 +165,21 @@ public class StoreInventoryService {
 
         int actual = n(inventory.getQuantity());
         int safety = n(master.getStoreSafetyStock());
-        return StoreInventoryDto.SkuRes.builder()
-                .skuCode(sku.getSkuCode())
-                .color(sku.getColor())
-                .size(sku.getSize())
-                .actualStock(actual)
-                .availableStock(n(inventory.getAvailableQuantity()))
-                .safetyStock(safety)
-                .status(resolveStatus(actual, safety))
-                .updatedAt(inventory.getUpdatedAt())
-                .build();
+        return StoreInventoryDto.SkuRes.from(
+                sku.getSkuCode(),
+                sku.getColor(),
+                sku.getSize(),
+                actual,
+                n(inventory.getAvailableQuantity()),
+                safety,
+                resolveStatus(actual, safety),
+                inventory.getUpdatedAt()
+        );
     }
 
+    // -------- 내부 메서드 --------
+
+    // 조회에 필요한 SKU/상품/카테고리 참조 맵을 구성한다.
     private Context buildContext(List<Inventory> inventories) {
         Set<Long> skuIds = inventories.stream().map(Inventory::getSkuId).collect(Collectors.toSet());
         Map<Long, ProductSku> skuById = productSkuRepository.findAllById(skuIds).stream()
@@ -187,23 +196,25 @@ public class StoreInventoryService {
         return new Context(skuById, masterByCode, categoryById, categoryByCode);
     }
 
+    // locationCode로 매장 인프라를 조회한다.
     private Infrastructure resolveStore(String locationCode) {
         return infrastructureRepository.findByCodeAndLocationType(locationCode, LocationType.STORE)
                 .orElseThrow(() -> BaseException.from(BaseResponseStatus.STORE_SALE_STORE_NOT_FOUND));
     }
 
+    // 실재고와 안전재고 기준으로 품절/부족/정상 상태를 계산한다.
     private String resolveStatus(int actual, int safety) {
         if (actual == 0) return "품절";
         if (actual <= safety) return "부족";
         return "정상";
     }
 
+    // 메인 카테고리 우선순위 기준으로 정렬 순서를 계산한다.
     private int compareMainCategory(String a, String b) {
-        List<String> order = List.of("상의", "바지", "치마", "아우터");
-        int ai = order.indexOf(a);
-        int bi = order.indexOf(b);
-        ai = ai < 0 ? order.size() : ai;
-        bi = bi < 0 ? order.size() : bi;
+        int ai = MAIN_CATEGORY_ORDER.indexOf(a);
+        int bi = MAIN_CATEGORY_ORDER.indexOf(b);
+        ai = ai < 0 ? MAIN_CATEGORY_ORDER.size() : ai;
+        bi = bi < 0 ? MAIN_CATEGORY_ORDER.size() : bi;
         if (ai != bi) return Integer.compare(ai, bi);
         return String.valueOf(a).compareTo(String.valueOf(b));
     }

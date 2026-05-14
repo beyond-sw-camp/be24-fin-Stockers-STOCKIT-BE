@@ -10,11 +10,21 @@ import org.example.stockitbe.common.model.BaseEntity;
 import java.util.Date;
 
 @Entity
-@Table(name = "inventory", uniqueConstraints = {
+@Table(name = "inventory",
+    uniqueConstraints = {
         @UniqueConstraint(name = "uk_inventory_sku_location_status", columnNames = {"sku_id", "location_id", "inventory_status"})
-})
+    },
+    // (location_id, inventory_status) 복합 인덱스 — 창고 재고 조회 핵심 필터.
+    // 단일 (location_id) 보다 status IN (...) 까지 cover 가능.
+    // 기존 uk 의 prefix 가 sku_id 라 location 단독 검색은 자동 활용 안 됨.
+    indexes = {
+        @Index(name = "idx_inventory_location_status", columnList = "location_id, inventory_status")
+    }
+)
 @Getter
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
+// 재고 엔티티
+// SKU + 위치 + 상태 조합별 수량 스냅샷과 전이 상태를 관리한다.
 public class Inventory extends BaseEntity {
 
     @Id
@@ -64,16 +74,19 @@ public class Inventory extends BaseEntity {
         this.lastMovementAt = lastMovementAt == null ? new Date() : lastMovementAt;
     }
 
+    // NORMAL -> CIRCULAR_CANDIDATE 상태 전이
     public void markCircularCandidate(Date changedAt) {
         this.inventoryStatus = InventoryStatus.CIRCULAR_CANDIDATE;
         this.statusChangedAt = changedAt == null ? new Date() : changedAt;
     }
 
+    // CIRCULAR 상태 전이
     public void markCircular(Date changedAt) {
         this.inventoryStatus = InventoryStatus.CIRCULAR;
         this.statusChangedAt = changedAt == null ? new Date() : changedAt;
     }
 
+    // 후보 재고를 순환재고로 전환할 때 원본 재고를 차감한다.
     public void decreaseForConversion(int quantityToMove) {
         int safeMove = Math.max(0, quantityToMove);
         int nextAvailable = Math.max(0, n(this.availableQuantity) - safeMove);
@@ -82,12 +95,14 @@ public class Inventory extends BaseEntity {
         this.quantity = nextQuantity;
     }
 
+    // 순환재고 전환 수량을 대상 재고에 가산한다.
     public void increaseForConversion(int quantityToMove) {
         int safeMove = Math.max(0, quantityToMove);
         this.availableQuantity = n(this.availableQuantity) + safeMove;
         this.quantity = n(this.quantity) + safeMove;
     }
 
+    // 동일 SKU/위치 후보 재고를 병합한다.
     public void absorbAsCircularCandidate(Inventory source, Date changedAt) {
         if (source == null) return;
         this.quantity = n(this.quantity) + n(source.getQuantity());
@@ -98,6 +113,7 @@ public class Inventory extends BaseEntity {
         this.lastMovementAt = maxDate(this.lastMovementAt, source.getLastMovementAt());
     }
 
+    // 실재고와 가용재고가 모두 0 이하인지 확인한다.
     public boolean isEmptyStock() {
         return n(this.quantity) <= 0 && n(this.availableQuantity) <= 0;
     }
